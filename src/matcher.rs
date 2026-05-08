@@ -31,6 +31,10 @@ pub fn matches(doc: &Value, filter: &Value) -> Result<bool> {
 
 fn match_logical(doc: &Value, op: &str, val: &Value) -> Result<bool> {
     match op {
+        "expr" => {
+            let v = crate::aggregate::eval_expr(doc, val)?;
+            Ok(crate::aggregate::is_truthy(&v))
+        }
         "and" => {
             let arr = val
                 .as_array()

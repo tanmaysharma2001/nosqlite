@@ -12,4 +12,4 @@ Example:
 from ._nosqlite import Database, Collection, Transaction
 
 __all__ = ["Database", "Collection", "Transaction"]
-__version__ = "0.1.0"
+__version__ = "0.2.0"

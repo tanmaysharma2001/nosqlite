@@ -41,6 +41,113 @@ fn parse_format(s: Option<&str>, path: &std::path::Path) -> nosqlite::Format {
     }
 }
 
+fn parse_return_document(s: &str) -> PyResult<nosqlite::ReturnDocument> {
+    match s {
+        "before" => Ok(nosqlite::ReturnDocument::Before),
+        "after" => Ok(nosqlite::ReturnDocument::After),
+        other => Err(PyValueError::new_err(format!(
+            "return_document must be 'before' or 'after', got {:?}",
+            other
+        ))),
+    }
+}
+
+fn update_result_to_dict<'py>(
+    py: Python<'py>,
+    r: &nosqlite::UpdateResult,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new_bound(py);
+    d.set_item("matched_count", r.matched_count)?;
+    d.set_item("modified_count", r.modified_count)?;
+    match &r.upserted_id {
+        Some(s) => d.set_item("upserted_id", s)?,
+        None => d.set_item("upserted_id", py.None())?,
+    }
+    Ok(d)
+}
+
+fn bulk_result_to_dict<'py>(
+    py: Python<'py>,
+    r: &nosqlite::BulkWriteResult,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new_bound(py);
+    d.set_item("inserted_count", r.inserted_count)?;
+    d.set_item("matched_count", r.matched_count)?;
+    d.set_item("modified_count", r.modified_count)?;
+    d.set_item("deleted_count", r.deleted_count)?;
+    let ups = PyList::empty_bound(py);
+    for (i, id) in &r.upserted_ids {
+        let pair = PyDict::new_bound(py);
+        pair.set_item("index", *i)?;
+        pair.set_item("_id", id)?;
+        ups.append(pair)?;
+    }
+    d.set_item("upserted_ids", ups)?;
+    Ok(d)
+}
+
+fn parse_write_op(item: &Bound<'_, PyAny>) -> PyResult<nosqlite::WriteOp> {
+    let dict: &Bound<'_, PyDict> = item
+        .downcast()
+        .map_err(|_| PyValueError::new_err("bulk_write op must be a dict"))?;
+    if dict.len() != 1 {
+        return Err(PyValueError::new_err(
+            "bulk_write op must have exactly one key (e.g. 'insertOne')",
+        ));
+    }
+    let (key, body) = dict
+        .iter()
+        .next()
+        .ok_or_else(|| PyValueError::new_err("bulk_write op is empty"))?;
+    let kind: String = key.extract()?;
+    let body: &Bound<'_, PyDict> = body
+        .downcast()
+        .map_err(|_| PyValueError::new_err("bulk_write op body must be a dict"))?;
+    let get = |k: &str| -> PyResult<Bound<'_, PyAny>> {
+        body.get_item(k)?
+            .ok_or_else(|| PyValueError::new_err(format!("{}.{} required", kind, k)))
+    };
+    let upsert_flag = || -> PyResult<bool> {
+        match body.get_item("upsert")? {
+            None => Ok(false),
+            Some(b) if b.is_none() => Ok(false),
+            Some(b) => b.extract::<bool>(),
+        }
+    };
+    Ok(match kind.as_str() {
+        "insertOne" => nosqlite::WriteOp::InsertOne {
+            document: dep_value(&get("document")?)?,
+        },
+        "updateOne" => nosqlite::WriteOp::UpdateOne {
+            filter: dep_value(&get("filter")?)?,
+            update: dep_value(&get("update")?)?,
+            upsert: upsert_flag()?,
+        },
+        "updateMany" => nosqlite::WriteOp::UpdateMany {
+            filter: dep_value(&get("filter")?)?,
+            update: dep_value(&get("update")?)?,
+            upsert: upsert_flag()?,
+        },
+        "replaceOne" => nosqlite::WriteOp::ReplaceOne {
+            filter: dep_value(&get("filter")?)?,
+            replacement: dep_value(&get("replacement")?)?,
+            upsert: upsert_flag()?,
+        },
+        "deleteOne" => nosqlite::WriteOp::DeleteOne {
+            filter: dep_value(&get("filter")?)?,
+        },
+        "deleteMany" => nosqlite::WriteOp::DeleteMany {
+            filter: dep_value(&get("filter")?)?,
+        },
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "unknown bulk_write op {:?}",
+                other
+            )))
+        }
+    })
+}
+
 #[pyclass(name = "Database")]
 struct PyDatabase {
     inner: Arc<nosqlite::Database>,
@@ -242,6 +349,206 @@ impl PyCollection {
             .collection(&self.name)
             .delete_many(dep_value(filter)?)
             .map_err(map_err)
+    }
+
+    /// Update a single doc with options. With `upsert=True`, inserts a new
+    /// document when no match is found. Returns a dict with
+    /// `matched_count`, `modified_count`, and `upserted_id`.
+    #[pyo3(signature = (filter, update, *, upsert=false))]
+    fn update_one_with_options(
+        &self,
+        py: Python<'_>,
+        filter: &Bound<'_, PyAny>,
+        update: &Bound<'_, PyAny>,
+        upsert: bool,
+    ) -> PyResult<PyObject> {
+        let r = self
+            .db
+            .collection(&self.name)
+            .update_one_with_options(
+                dep_value(filter)?,
+                dep_value(update)?,
+                nosqlite::UpdateOptions { upsert },
+            )
+            .map_err(map_err)?;
+        Ok(update_result_to_dict(py, &r)?.into())
+    }
+
+    #[pyo3(signature = (filter, update, *, upsert=false))]
+    fn update_many_with_options(
+        &self,
+        py: Python<'_>,
+        filter: &Bound<'_, PyAny>,
+        update: &Bound<'_, PyAny>,
+        upsert: bool,
+    ) -> PyResult<PyObject> {
+        let r = self
+            .db
+            .collection(&self.name)
+            .update_many_with_options(
+                dep_value(filter)?,
+                dep_value(update)?,
+                nosqlite::UpdateOptions { upsert },
+            )
+            .map_err(map_err)?;
+        Ok(update_result_to_dict(py, &r)?.into())
+    }
+
+    #[pyo3(signature = (filter, replacement, *, upsert=false))]
+    fn replace_one_with_options(
+        &self,
+        py: Python<'_>,
+        filter: &Bound<'_, PyAny>,
+        replacement: &Bound<'_, PyAny>,
+        upsert: bool,
+    ) -> PyResult<PyObject> {
+        let r = self
+            .db
+            .collection(&self.name)
+            .replace_one_with_options(
+                dep_value(filter)?,
+                dep_value(replacement)?,
+                nosqlite::UpdateOptions { upsert },
+            )
+            .map_err(map_err)?;
+        Ok(update_result_to_dict(py, &r)?.into())
+    }
+
+    /// Atomically find a document and apply `update` to it.
+    /// `return_document` is "before" (default) or "after".
+    #[pyo3(signature = (filter, update, *, upsert=false, return_document="before", sort=None, projection=None))]
+    fn find_one_and_update(
+        &self,
+        py: Python<'_>,
+        filter: &Bound<'_, PyAny>,
+        update: &Bound<'_, PyAny>,
+        upsert: bool,
+        return_document: &str,
+        sort: Option<&Bound<'_, PyAny>>,
+        projection: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Option<PyObject>> {
+        let opts = nosqlite::FindOneAndUpdateOptions {
+            upsert,
+            return_document: parse_return_document(return_document)?,
+            sort: opt_value(sort)?,
+            projection: opt_value(projection)?,
+        };
+        let r = self
+            .db
+            .collection(&self.name)
+            .find_one_and_update_with_options(dep_value(filter)?, dep_value(update)?, opts)
+            .map_err(map_err)?;
+        match r {
+            None => Ok(None),
+            Some(d) => Ok(Some(to_py(py, &d)?)),
+        }
+    }
+
+    #[pyo3(signature = (filter, replacement, *, upsert=false, return_document="before", sort=None, projection=None))]
+    fn find_one_and_replace(
+        &self,
+        py: Python<'_>,
+        filter: &Bound<'_, PyAny>,
+        replacement: &Bound<'_, PyAny>,
+        upsert: bool,
+        return_document: &str,
+        sort: Option<&Bound<'_, PyAny>>,
+        projection: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Option<PyObject>> {
+        let opts = nosqlite::FindOneAndUpdateOptions {
+            upsert,
+            return_document: parse_return_document(return_document)?,
+            sort: opt_value(sort)?,
+            projection: opt_value(projection)?,
+        };
+        let r = self
+            .db
+            .collection(&self.name)
+            .find_one_and_replace_with_options(
+                dep_value(filter)?,
+                dep_value(replacement)?,
+                opts,
+            )
+            .map_err(map_err)?;
+        match r {
+            None => Ok(None),
+            Some(d) => Ok(Some(to_py(py, &d)?)),
+        }
+    }
+
+    #[pyo3(signature = (filter, *, sort=None, projection=None))]
+    fn find_one_and_delete(
+        &self,
+        py: Python<'_>,
+        filter: &Bound<'_, PyAny>,
+        sort: Option<&Bound<'_, PyAny>>,
+        projection: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Option<PyObject>> {
+        let opts = nosqlite::FindOneAndDeleteOptions {
+            sort: opt_value(sort)?,
+            projection: opt_value(projection)?,
+        };
+        let r = self
+            .db
+            .collection(&self.name)
+            .find_one_and_delete_with_options(dep_value(filter)?, opts)
+            .map_err(map_err)?;
+        match r {
+            None => Ok(None),
+            Some(d) => Ok(Some(to_py(py, &d)?)),
+        }
+    }
+
+    #[pyo3(signature = (field, filter=None))]
+    fn distinct(
+        &self,
+        py: Python<'_>,
+        field: &str,
+        filter: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<PyObject> {
+        let f = match filter {
+            Some(b) if !b.is_none() => dep_value(b)?,
+            _ => serde_json::json!({}),
+        };
+        let vals = self
+            .db
+            .collection(&self.name)
+            .distinct(field, f)
+            .map_err(map_err)?;
+        let list = PyList::empty_bound(py);
+        for v in &vals {
+            list.append(to_py(py, v)?)?;
+        }
+        Ok(list.into())
+    }
+
+    /// Execute a sequence of writes in a single transaction. `ops` is a
+    /// list of dicts shaped like:
+    ///   {"insertOne":  {"document": {...}}}
+    ///   {"updateOne":  {"filter": {...}, "update": {...}, "upsert": false}}
+    ///   {"updateMany": {...}}
+    ///   {"replaceOne": {"filter": {...}, "replacement": {...}, "upsert": false}}
+    ///   {"deleteOne":  {"filter": {...}}}
+    ///   {"deleteMany": {"filter": {...}}}
+    /// Returns a dict with inserted_count / matched_count / modified_count /
+    /// deleted_count / upserted_ids.
+    #[pyo3(signature = (ops, *, ordered=true))]
+    fn bulk_write(
+        &self,
+        py: Python<'_>,
+        ops: &Bound<'_, PyList>,
+        ordered: bool,
+    ) -> PyResult<PyObject> {
+        let mut write_ops: Vec<nosqlite::WriteOp> = Vec::with_capacity(ops.len());
+        for item in ops.iter() {
+            write_ops.push(parse_write_op(&item)?);
+        }
+        let r = self
+            .db
+            .collection(&self.name)
+            .bulk_write_with_options(write_ops, nosqlite::BulkWriteOptions { ordered })
+            .map_err(map_err)?;
+        Ok(bulk_result_to_dict(py, &r)?.into())
     }
 
     fn aggregate(&self, py: Python<'_>, pipeline: &Bound<'_, PyList>) -> PyResult<PyObject> {

@@ -11,7 +11,7 @@ use crate::util::{ensure_id, mongo_path, now_ms, validate_identifier};
 use crate::validation::Validator;
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{params, Connection};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 #[derive(Default, Clone)]
 pub struct FindOptions {
@@ -19,6 +19,87 @@ pub struct FindOptions {
     pub projection: Option<Value>,
     pub limit: Option<i64>,
     pub skip: Option<i64>,
+}
+
+#[derive(Default, Clone, Debug)]
+pub struct UpdateOptions {
+    pub upsert: bool,
+}
+
+#[derive(Default, Clone, Debug)]
+pub struct UpdateResult {
+    pub matched_count: u64,
+    pub modified_count: u64,
+    pub upserted_id: Option<String>,
+}
+
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReturnDocument {
+    #[default]
+    Before,
+    After,
+}
+
+#[derive(Default, Clone)]
+pub struct FindOneAndUpdateOptions {
+    pub upsert: bool,
+    pub return_document: ReturnDocument,
+    pub sort: Option<Value>,
+    pub projection: Option<Value>,
+}
+
+#[derive(Default, Clone)]
+pub struct FindOneAndDeleteOptions {
+    pub sort: Option<Value>,
+    pub projection: Option<Value>,
+}
+
+#[derive(Clone)]
+pub enum WriteOp {
+    InsertOne {
+        document: Value,
+    },
+    UpdateOne {
+        filter: Value,
+        update: Value,
+        upsert: bool,
+    },
+    UpdateMany {
+        filter: Value,
+        update: Value,
+        upsert: bool,
+    },
+    ReplaceOne {
+        filter: Value,
+        replacement: Value,
+        upsert: bool,
+    },
+    DeleteOne {
+        filter: Value,
+    },
+    DeleteMany {
+        filter: Value,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct BulkWriteOptions {
+    pub ordered: bool,
+}
+
+impl Default for BulkWriteOptions {
+    fn default() -> Self {
+        Self { ordered: true }
+    }
+}
+
+#[derive(Default, Debug, Clone)]
+pub struct BulkWriteResult {
+    pub inserted_count: u64,
+    pub matched_count: u64,
+    pub modified_count: u64,
+    pub deleted_count: u64,
+    pub upserted_ids: Vec<(usize, String)>,
 }
 
 pub fn ensure_table(conn: &Connection, name: &str) -> Result<()> {
@@ -124,10 +205,32 @@ pub fn count(conn: &Connection, name: &str, filter: &Value) -> Result<i64> {
     if !table_exists(conn, name)? {
         return Ok(0);
     }
+    let exprs = extract_exprs(filter);
     let (where_clause, params) = build_where(name, filter)?;
-    let sql = format!("SELECT COUNT(*) FROM \"{}\" WHERE {}", name, where_clause);
+    if exprs.is_empty() {
+        let sql = format!("SELECT COUNT(*) FROM \"{}\" WHERE {}", name, where_clause);
+        let mut stmt = conn.prepare(&sql)?;
+        let n: i64 = stmt.query_row(rusqlite::params_from_iter(params.iter()), |r| r.get(0))?;
+        return Ok(n);
+    }
+    // Fall back to scanning candidate rows when $expr is present.
+    let sql = format!("SELECT doc FROM \"{}\" WHERE {}", name, where_clause);
     let mut stmt = conn.prepare(&sql)?;
-    let n: i64 = stmt.query_row(rusqlite::params_from_iter(params.iter()), |r| r.get(0))?;
+    let rows: Vec<String> = {
+        let collected: rusqlite::Result<Vec<String>> = stmt
+            .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect();
+        collected?
+    };
+    let mut n = 0i64;
+    for s in rows {
+        let v: Value = serde_json::from_str(&s)?;
+        if expr_matches(&v, &exprs)? {
+            n += 1;
+        }
+    }
     Ok(n)
 }
 
@@ -140,7 +243,23 @@ pub fn find_into_vec(
     if !table_exists(conn, name)? {
         return Ok(Vec::new());
     }
-    let (sql, params) = build_find_sql(name, filter, opts)?;
+    let exprs = extract_exprs(filter);
+    // If $expr is present, defer LIMIT/SKIP to after the in-Rust filter.
+    let (sql_opts, post_skip, post_limit) = if exprs.is_empty() {
+        (opts.clone(), None, None)
+    } else {
+        (
+            FindOptions {
+                sort: opts.sort.clone(),
+                projection: opts.projection.clone(),
+                limit: None,
+                skip: None,
+            },
+            opts.skip,
+            opts.limit,
+        )
+    };
+    let (sql, params) = build_find_sql(name, filter, &sql_opts)?;
     let mut stmt = conn.prepare(&sql)?;
     let raw: Vec<String> = {
         let collected: rusqlite::Result<Vec<String>> = stmt
@@ -151,12 +270,29 @@ pub fn find_into_vec(
         collected?
     };
     let mut out = Vec::with_capacity(raw.len());
+    let mut skipped = 0i64;
     for s in raw {
-        let mut v: Value = serde_json::from_str(&s)?;
-        if let Some(p) = &opts.projection {
-            v = apply_projection(&v, p)?;
+        let v: Value = serde_json::from_str(&s)?;
+        if !exprs.is_empty() && !expr_matches(&v, &exprs)? {
+            continue;
         }
-        out.push(v);
+        if let Some(n) = post_skip {
+            if skipped < n {
+                skipped += 1;
+                continue;
+            }
+        }
+        let projected = if let Some(p) = &opts.projection {
+            apply_projection(&v, p)?
+        } else {
+            v
+        };
+        out.push(projected);
+        if let Some(n) = post_limit {
+            if (out.len() as i64) >= n {
+                break;
+            }
+        }
     }
     Ok(out)
 }
@@ -213,7 +349,7 @@ fn build_find_sql(
 /// Compile `filter` into a SQL `WHERE`-fragment and parameter list,
 /// handling any top-level `$text` operators by merging in an FTS subquery.
 fn build_where(name: &str, filter: &Value) -> Result<(String, Vec<SqlValue>)> {
-    let (rest, text_clauses) = split_text(filter);
+    let (rest, text_clauses, _exprs) = split_special(filter);
     let compiled = query::compile(&rest)?;
     let mut where_clause = compiled.sql;
     let mut params = compiled.params;
@@ -228,19 +364,28 @@ fn build_where(name: &str, filter: &Value) -> Result<(String, Vec<SqlValue>)> {
     Ok((where_clause, params))
 }
 
-/// Walk `filter` removing top-level `$text` operators and returning the
-/// rewritten filter plus a list of search strings to AND in.
-fn split_text(filter: &Value) -> (Value, Vec<String>) {
+/// Walk `filter` removing top-level `$text` and `$expr` operators and
+/// returning the rewritten filter plus the search strings (text) and
+/// expression bodies that need post-filtering in Rust.
+fn split_special(filter: &Value) -> (Value, Vec<String>, Vec<Value>) {
     let mut texts = Vec::new();
+    let mut exprs = Vec::new();
     let rest = match filter {
         Value::Object(o) => {
             let mut new_obj = serde_json::Map::new();
             for (k, v) in o {
-                if k == "$text" {
-                    if let Some(s) = v.get("$search").and_then(|x| x.as_str()) {
-                        texts.push(s.to_string());
+                match k.as_str() {
+                    "$text" => {
+                        if let Some(s) = v.get("$search").and_then(|x| x.as_str()) {
+                            texts.push(s.to_string());
+                            continue;
+                        }
+                    }
+                    "$expr" => {
+                        exprs.push(v.clone());
                         continue;
                     }
+                    _ => {}
                 }
                 new_obj.insert(k.clone(), v.clone());
             }
@@ -248,7 +393,22 @@ fn split_text(filter: &Value) -> (Value, Vec<String>) {
         }
         _ => filter.clone(),
     };
-    (rest, texts)
+    (rest, texts, exprs)
+}
+
+/// Returns true if the doc satisfies every `$expr` body in `exprs`.
+fn expr_matches(doc: &Value, exprs: &[Value]) -> Result<bool> {
+    for e in exprs {
+        let v = crate::aggregate::eval_expr(doc, e)?;
+        if !crate::aggregate::is_truthy(&v) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn extract_exprs(filter: &Value) -> Vec<Value> {
+    split_special(filter).2
 }
 
 fn compile_order_by(spec: &Value) -> Result<String> {
@@ -279,16 +439,119 @@ pub fn update_internal(
     only_one: bool,
     validator: Option<&Validator>,
 ) -> Result<u64> {
-    if !table_exists(conn, name)? {
-        return Ok(0);
+    let r = update_with_options(
+        conn,
+        name,
+        filter,
+        update_doc,
+        only_one,
+        &UpdateOptions::default(),
+        validator,
+    )?;
+    Ok(r.modified_count)
+}
+
+pub fn update_with_options(
+    conn: &mut Connection,
+    name: &str,
+    filter: &Value,
+    update_doc: &Value,
+    only_one: bool,
+    options: &UpdateOptions,
+    validator: Option<&Validator>,
+) -> Result<UpdateResult> {
+    if options.upsert {
+        ensure_table(conn, name)?;
+    } else if !table_exists(conn, name)? {
+        return Ok(UpdateResult::default());
     }
     if conn.is_autocommit() {
         let tx = conn.transaction()?;
-        let n = update_rows_in(&tx, name, filter, update_doc, only_one, validator)?;
+        let r =
+            update_with_options_in(&tx, name, filter, update_doc, only_one, options, validator)?;
         tx.commit()?;
-        Ok(n)
+        Ok(r)
     } else {
-        update_rows_in(conn, name, filter, update_doc, only_one, validator)
+        update_with_options_in(conn, name, filter, update_doc, only_one, options, validator)
+    }
+}
+
+fn update_with_options_in(
+    conn: &Connection,
+    name: &str,
+    filter: &Value,
+    update_doc: &Value,
+    only_one: bool,
+    options: &UpdateOptions,
+    validator: Option<&Validator>,
+) -> Result<UpdateResult> {
+    let modified = update_rows_in(conn, name, filter, update_doc, only_one, validator)?;
+    let mut result = UpdateResult {
+        matched_count: modified,
+        modified_count: modified,
+        upserted_id: None,
+    };
+    if modified == 0 && options.upsert {
+        let mut doc = upsert_baseline_from_filter(filter);
+        update::apply(&mut doc, update_doc)?;
+        let id = ensure_id(&mut doc)?;
+        if let Some(v) = validator {
+            v.validate(&doc)?;
+        }
+        let now = now_ms();
+        conn.execute(
+            &format!(
+                "INSERT INTO \"{}\" (_id, doc, created_at, updated_at) VALUES (?, ?, ?, ?)",
+                name
+            ),
+            params![&id, doc.to_string(), now, now],
+        )?;
+        crate::fts::reindex_one(conn, name, &id, &doc)?;
+        result.upserted_id = Some(id);
+    }
+    Ok(result)
+}
+
+/// Build a baseline document from a filter's top-level equality clauses,
+/// to seed an upsert insert. Operator keys (`$and`, `$or`, `$expr`, …) and
+/// operator-only field values (`{age: {$gt: 18}}`) are skipped. Dotted
+/// paths are walked to set nested fields.
+fn upsert_baseline_from_filter(filter: &Value) -> Value {
+    let mut base = Map::new();
+    if let Value::Object(o) = filter {
+        for (k, v) in o {
+            if k.starts_with('$') {
+                continue;
+            }
+            if let Value::Object(inner) = v {
+                if inner.keys().any(|kk| kk.starts_with('$')) {
+                    continue;
+                }
+            }
+            set_in_map(&mut base, k, v.clone());
+        }
+    }
+    Value::Object(base)
+}
+
+fn set_in_map(map: &mut Map<String, Value>, path: &str, val: Value) {
+    let segments: Vec<&str> = path.split('.').filter(|s| !s.is_empty()).collect();
+    if segments.is_empty() {
+        return;
+    }
+    if segments.len() == 1 {
+        map.insert(segments[0].to_string(), val);
+        return;
+    }
+    let entry = map
+        .entry(segments[0].to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !entry.is_object() {
+        *entry = Value::Object(Map::new());
+    }
+    if let Value::Object(inner) = entry {
+        let rest = segments[1..].join(".");
+        set_in_map(inner, &rest, val);
     }
 }
 
@@ -300,8 +563,11 @@ fn update_rows_in(
     only_one: bool,
     validator: Option<&Validator>,
 ) -> Result<u64> {
+    let exprs = extract_exprs(filter);
     let (where_clause, where_params) = build_where(name, filter)?;
-    let select_sql = if only_one {
+    // When $expr is present we can't push LIMIT down to SQL, so load
+    // candidates and filter in Rust.
+    let select_sql = if only_one && exprs.is_empty() {
         format!(
             "SELECT _id, doc FROM \"{}\" WHERE {} LIMIT 1",
             name, where_clause
@@ -331,6 +597,9 @@ fn update_rows_in(
         let mut stmt = conn.prepare(&upd_sql)?;
         for (id, raw) in rows {
             let mut doc: Value = serde_json::from_str(&raw)?;
+            if !exprs.is_empty() && !expr_matches(&doc, &exprs)? {
+                continue;
+            }
             update::apply(&mut doc, update_doc)?;
             if let Some(o) = doc.as_object_mut() {
                 o.insert("_id".into(), Value::String(id.clone()));
@@ -341,6 +610,9 @@ fn update_rows_in(
             stmt.execute(params![doc.to_string(), now, id])?;
             crate::fts::reindex_one(conn, name, &id, &doc)?;
             updated += 1;
+            if only_one {
+                break;
+            }
         }
     }
     Ok(updated)
@@ -355,19 +627,367 @@ pub fn delete_internal(
     if !table_exists(conn, name)? {
         return Ok(0);
     }
+    let exprs = extract_exprs(filter);
     let (where_clause, where_params) = build_where(name, filter)?;
-    let sql = if only_one {
-        format!(
-            "DELETE FROM \"{0}\" WHERE _id IN \
-             (SELECT _id FROM \"{0}\" WHERE {1} LIMIT 1)",
-            name, where_clause
-        )
-    } else {
-        format!("DELETE FROM \"{}\" WHERE {}", name, where_clause)
+
+    if exprs.is_empty() {
+        let sql = if only_one {
+            format!(
+                "DELETE FROM \"{0}\" WHERE _id IN \
+                 (SELECT _id FROM \"{0}\" WHERE {1} LIMIT 1)",
+                name, where_clause
+            )
+        } else {
+            format!("DELETE FROM \"{}\" WHERE {}", name, where_clause)
+        };
+        let n = conn.execute(&sql, rusqlite::params_from_iter(where_params.iter()))?;
+        crate::fts::clear_orphans(conn, name)?;
+        return Ok(n as u64);
+    }
+
+    // $expr: identify ids in Rust, then delete by id list.
+    let select_sql = format!("SELECT _id, doc FROM \"{}\" WHERE {}", name, where_clause);
+    let mut stmt = conn.prepare(&select_sql)?;
+    let candidates: Vec<(String, String)> = {
+        let collected: rusqlite::Result<Vec<(String, String)>> = stmt
+            .query_map(rusqlite::params_from_iter(where_params.iter()), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect();
+        collected?
     };
-    let n = conn.execute(&sql, rusqlite::params_from_iter(where_params.iter()))?;
-    // Remove orphaned FTS rows. The FTS table is keyed by _id, so a fresh
-    // sync on next insert/update is fine; we just clear here.
+    drop(stmt);
+    let mut to_delete: Vec<String> = Vec::new();
+    for (id, raw) in candidates {
+        let v: Value = serde_json::from_str(&raw)?;
+        if expr_matches(&v, &exprs)? {
+            to_delete.push(id);
+            if only_one {
+                break;
+            }
+        }
+    }
+    let mut n = 0u64;
+    if !to_delete.is_empty() {
+        let del_sql = format!("DELETE FROM \"{}\" WHERE _id = ?", name);
+        let mut stmt = conn.prepare(&del_sql)?;
+        for id in &to_delete {
+            n += stmt.execute(params![id])? as u64;
+        }
+    }
     crate::fts::clear_orphans(conn, name)?;
-    Ok(n as u64)
+    Ok(n)
+}
+
+pub fn find_one_and_update(
+    conn: &mut Connection,
+    name: &str,
+    filter: &Value,
+    update_doc: &Value,
+    options: &FindOneAndUpdateOptions,
+    validator: Option<&Validator>,
+) -> Result<Option<Value>> {
+    if options.upsert {
+        ensure_table(conn, name)?;
+    } else if !table_exists(conn, name)? {
+        return Ok(None);
+    }
+    if conn.is_autocommit() {
+        let tx = conn.transaction()?;
+        let r = find_one_and_update_in(&tx, name, filter, update_doc, options, validator)?;
+        tx.commit()?;
+        Ok(r)
+    } else {
+        find_one_and_update_in(conn, name, filter, update_doc, options, validator)
+    }
+}
+
+fn find_one_and_update_in(
+    conn: &Connection,
+    name: &str,
+    filter: &Value,
+    update_doc: &Value,
+    options: &FindOneAndUpdateOptions,
+    validator: Option<&Validator>,
+) -> Result<Option<Value>> {
+    let find_opts = FindOptions {
+        sort: options.sort.clone(),
+        projection: None,
+        limit: Some(1),
+        skip: None,
+    };
+    let original = find_into_vec(conn, name, filter, &find_opts)?
+        .into_iter()
+        .next();
+
+    let after = if let Some(orig) = original.as_ref() {
+        let id = orig
+            .get("_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| crate::Error::InvalidQuery("matched doc has no _id".into()))?
+            .to_string();
+        let mut new_doc = orig.clone();
+        update::apply(&mut new_doc, update_doc)?;
+        if let Some(o) = new_doc.as_object_mut() {
+            o.insert("_id".into(), Value::String(id.clone()));
+        }
+        if let Some(v) = validator {
+            v.validate(&new_doc)?;
+        }
+        let now = now_ms();
+        conn.execute(
+            &format!(
+                "UPDATE \"{}\" SET doc = ?, updated_at = ? WHERE _id = ?",
+                name
+            ),
+            params![new_doc.to_string(), now, id],
+        )?;
+        crate::fts::reindex_one(conn, name, &id, &new_doc)?;
+        Some(new_doc)
+    } else if options.upsert {
+        let mut doc = upsert_baseline_from_filter(filter);
+        update::apply(&mut doc, update_doc)?;
+        let id = ensure_id(&mut doc)?;
+        if let Some(v) = validator {
+            v.validate(&doc)?;
+        }
+        let now = now_ms();
+        conn.execute(
+            &format!(
+                "INSERT INTO \"{}\" (_id, doc, created_at, updated_at) VALUES (?, ?, ?, ?)",
+                name
+            ),
+            params![&id, doc.to_string(), now, now],
+        )?;
+        crate::fts::reindex_one(conn, name, &id, &doc)?;
+        Some(doc)
+    } else {
+        None
+    };
+
+    let returned = match options.return_document {
+        ReturnDocument::Before => original,
+        ReturnDocument::After => after,
+    };
+    if let (Some(d), Some(p)) = (returned.as_ref(), options.projection.as_ref()) {
+        return Ok(Some(apply_projection(d, p)?));
+    }
+    Ok(returned)
+}
+
+pub fn find_one_and_delete(
+    conn: &mut Connection,
+    name: &str,
+    filter: &Value,
+    options: &FindOneAndDeleteOptions,
+) -> Result<Option<Value>> {
+    if !table_exists(conn, name)? {
+        return Ok(None);
+    }
+    if conn.is_autocommit() {
+        let tx = conn.transaction()?;
+        let r = find_one_and_delete_in(&tx, name, filter, options)?;
+        tx.commit()?;
+        Ok(r)
+    } else {
+        find_one_and_delete_in(conn, name, filter, options)
+    }
+}
+
+fn find_one_and_delete_in(
+    conn: &Connection,
+    name: &str,
+    filter: &Value,
+    options: &FindOneAndDeleteOptions,
+) -> Result<Option<Value>> {
+    let find_opts = FindOptions {
+        sort: options.sort.clone(),
+        projection: None,
+        limit: Some(1),
+        skip: None,
+    };
+    let docs = find_into_vec(conn, name, filter, &find_opts)?;
+    let original = docs.into_iter().next();
+    if let Some(o) = original.as_ref() {
+        let id = o
+            .get("_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| crate::Error::InvalidQuery("matched doc has no _id".into()))?
+            .to_string();
+        conn.execute(
+            &format!("DELETE FROM \"{}\" WHERE _id = ?", name),
+            params![&id],
+        )?;
+        crate::fts::clear_orphans(conn, name)?;
+    }
+    if let (Some(d), Some(p)) = (original.as_ref(), options.projection.as_ref()) {
+        return Ok(Some(apply_projection(d, p)?));
+    }
+    Ok(original)
+}
+
+pub fn distinct(conn: &Connection, name: &str, field: &str, filter: &Value) -> Result<Vec<Value>> {
+    if !table_exists(conn, name)? {
+        return Ok(Vec::new());
+    }
+    let exprs = extract_exprs(filter);
+    let (where_clause, where_params) = build_where(name, filter)?;
+    let sql = format!("SELECT doc FROM \"{}\" WHERE {}", name, where_clause);
+    let mut stmt = conn.prepare(&sql)?;
+    let raw: Vec<String> = {
+        let collected: rusqlite::Result<Vec<String>> = stmt
+            .query_map(rusqlite::params_from_iter(where_params.iter()), |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect();
+        collected?
+    };
+    let mut seen: Vec<Value> = Vec::new();
+    for s in raw {
+        let v: Value = serde_json::from_str(&s)?;
+        if !exprs.is_empty() && !expr_matches(&v, &exprs)? {
+            continue;
+        }
+        let extracted = crate::matcher::lookup_path(&v, field).cloned();
+        match extracted {
+            Some(Value::Array(items)) => {
+                for item in items {
+                    if !seen.iter().any(|x| x == &item) {
+                        seen.push(item);
+                    }
+                }
+            }
+            Some(other) => {
+                if !seen.iter().any(|x| x == &other) {
+                    seen.push(other);
+                }
+            }
+            None => {}
+        }
+    }
+    Ok(seen)
+}
+
+pub fn bulk_write(
+    conn: &mut Connection,
+    name: &str,
+    ops: Vec<WriteOp>,
+    options: &BulkWriteOptions,
+    validator: Option<&Validator>,
+) -> Result<BulkWriteResult> {
+    ensure_table(conn, name)?;
+    if conn.is_autocommit() {
+        let tx = conn.transaction()?;
+        let r = bulk_write_in(&tx, name, ops, options, validator);
+        match r {
+            Ok(r) => {
+                tx.commit()?;
+                Ok(r)
+            }
+            Err(e) => {
+                let _ = tx.rollback();
+                Err(e)
+            }
+        }
+    } else {
+        bulk_write_in(conn, name, ops, options, validator)
+    }
+}
+
+fn bulk_write_in(
+    conn: &Connection,
+    name: &str,
+    ops: Vec<WriteOp>,
+    options: &BulkWriteOptions,
+    validator: Option<&Validator>,
+) -> Result<BulkWriteResult> {
+    let mut result = BulkWriteResult::default();
+    for (i, op) in ops.into_iter().enumerate() {
+        let outcome: Result<()> = (|| {
+            match op {
+                WriteOp::InsertOne { document } => {
+                    insert_one(conn, name, document, validator)?;
+                    result.inserted_count += 1;
+                }
+                WriteOp::UpdateOne {
+                    filter,
+                    update,
+                    upsert,
+                } => {
+                    let r = update_with_options_in(
+                        conn,
+                        name,
+                        &filter,
+                        &update,
+                        true,
+                        &UpdateOptions { upsert },
+                        validator,
+                    )?;
+                    result.matched_count += r.matched_count;
+                    result.modified_count += r.modified_count;
+                    if let Some(id) = r.upserted_id {
+                        result.upserted_ids.push((i, id));
+                    }
+                }
+                WriteOp::UpdateMany {
+                    filter,
+                    update,
+                    upsert,
+                } => {
+                    let r = update_with_options_in(
+                        conn,
+                        name,
+                        &filter,
+                        &update,
+                        false,
+                        &UpdateOptions { upsert },
+                        validator,
+                    )?;
+                    result.matched_count += r.matched_count;
+                    result.modified_count += r.modified_count;
+                    if let Some(id) = r.upserted_id {
+                        result.upserted_ids.push((i, id));
+                    }
+                }
+                WriteOp::ReplaceOne {
+                    filter,
+                    replacement,
+                    upsert,
+                } => {
+                    let r = update_with_options_in(
+                        conn,
+                        name,
+                        &filter,
+                        &replacement,
+                        true,
+                        &UpdateOptions { upsert },
+                        validator,
+                    )?;
+                    result.matched_count += r.matched_count;
+                    result.modified_count += r.modified_count;
+                    if let Some(id) = r.upserted_id {
+                        result.upserted_ids.push((i, id));
+                    }
+                }
+                WriteOp::DeleteOne { filter } => {
+                    let n = delete_internal(conn, name, &filter, true)?;
+                    result.deleted_count += n;
+                }
+                WriteOp::DeleteMany { filter } => {
+                    let n = delete_internal(conn, name, &filter, false)?;
+                    result.deleted_count += n;
+                }
+            }
+            Ok(())
+        })();
+        if let Err(e) = outcome {
+            if options.ordered {
+                return Err(e);
+            }
+            // Unordered: continue past the failed op. The caller's transaction
+            // rollback semantics still apply, since we're inside a single tx.
+            // Best-effort: report as no-op contribution to counters.
+        }
+    }
+    Ok(result)
 }

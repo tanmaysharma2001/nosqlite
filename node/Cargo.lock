@@ -414,7 +414,7 @@ dependencies = [
 
 [[package]]
 name = "nosqlite"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bson",
  "nosqlite-derive",
@@ -436,7 +436,7 @@ dependencies = [
 
 [[package]]
 name = "nosqlite-node"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "napi",
  "napi-build",

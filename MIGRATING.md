@@ -24,8 +24,14 @@ There's no client/server. Open the file, work, drop the handle.
 | `db.users.find({ age: { $gt: 25 } }).sort({ age: -1 })` | `users.find(json!({ "age": { "$gt": 25 } })).sort(json!({ "age": -1 }))` |
 | `db.users.countDocuments({...})`                       | `users.count(json!({...}))?`                                            |
 | `db.users.updateOne(filter, { $set: {...} })`          | `users.update_one(filter, json!({ "$set": {...} }))?`                   |
+| `db.users.updateOne(filter, upd, { upsert: true })`    | `users.update_one_with_options(filter, upd, UpdateOptions { upsert: true })?` |
 | `db.users.replaceOne(filter, doc)`                     | `users.replace_one(filter, doc)?`                                       |
 | `db.users.deleteMany(filter)`                          | `users.delete_many(filter)?`                                            |
+| `db.users.findOneAndUpdate(filter, upd)`               | `users.find_one_and_update(filter, upd)?`                               |
+| `db.users.findOneAndReplace(filter, doc)`              | `users.find_one_and_replace(filter, doc)?`                              |
+| `db.users.findOneAndDelete(filter)`                    | `users.find_one_and_delete(filter)?`                                    |
+| `db.users.distinct("color", filter)`                   | `users.distinct("color", filter)?`                                      |
+| `db.users.bulkWrite([...])`                            | `users.bulk_write(vec![WriteOp::InsertOne { document }, ...])?`         |
 | `cursor.toArray()`                                     | `cursor.into_vec()?`                                                    |
 
 ## Operators
@@ -45,7 +51,10 @@ matching indexes.
 `$addToSet` `$count`
 **Aggregation expressions:** field references (`"$field"`), `$add`,
 `$subtract`, `$multiply`, `$divide`, `$concat`, `$toUpper`, `$toLower`,
-`$ifNull`, `$literal`
+`$ifNull`, `$literal`, `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$and`,
+`$or`, `$not`, `$cond`
+**Computed filters:** `$expr` (use any aggregation expression as a filter,
+e.g. `{ "$expr": { "$gt": ["$a", "$b"] } }`)
 **Full-text:** `$text` (`$search`) — backed by FTS5
 
 ## Indexes
@@ -203,6 +212,15 @@ A few cosmetic differences from PyMongo:
   the Rust crate.
 - Errors raise `RuntimeError` with the Rust error message attached.
 - `nosqlite.Database()` with no argument opens an in-memory database.
+- Mongo-style **upsert** is on the `_with_options` variants:
+  `users.update_one_with_options(filter, update, upsert=True)` returns
+  `{matched_count, modified_count, upserted_id}`. **find_one_and_** *
+  methods take kwargs:
+  `users.find_one_and_update(filter, update, upsert=False, return_document="before"|"after", sort=..., projection=...)`.
+- **bulk_write** takes a list of single-key dicts:
+  `users.bulk_write([{"insertOne": {"document": {...}}}, {"updateOne": {"filter": {...}, "update": {...}, "upsert": True}}, ...])`
+  and returns
+  `{inserted_count, matched_count, modified_count, deleted_count, upserted_ids: [{"index": int, "_id": str}]}`.
 
 ## Node.js / TypeScript
 
@@ -231,6 +249,15 @@ Differences from the official `mongodb` driver:
 - Transactions use a `try/finally` pattern with `beginTransaction()` →
   `commit()` / `rollback()`, instead of MongoDB sessions.
 - TypeScript types are bundled (`index.d.ts`).
+- Mongo-style **upsert** is on the `*WithOptions` variants:
+  `users.updateOneWithOptions(filter, update, { upsert: true })` returns
+  `{ matchedCount, modifiedCount, upsertedId }`. **findOneAnd*** methods
+  take an options object:
+  `users.findOneAndUpdate(filter, update, { upsert, returnDocument, sort, projection })`
+  where `returnDocument` is `'before'` (default) or `'after'`.
+- **bulkWrite** takes an array of single-key objects:
+  `users.bulkWrite([{ insertOne: { document } }, { updateOne: { filter, update, upsert: true } }, { deleteOne: { filter } }])`
+  and returns counters plus `upsertedIds: [{ index, id }]`.
 
 ## When to reach for MongoDB anyway
 

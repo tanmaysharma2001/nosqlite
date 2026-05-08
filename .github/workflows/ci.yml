@@ -74,6 +74,7 @@ jobs:
           maturin develop --release
           python tests/test_smoke.py
           python tests/test_orm.py
+          python tests/test_v0_2_0.py
 
   node:
     name: Node SDK

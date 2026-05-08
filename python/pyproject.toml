@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "nosqlite"
-version = "0.1.0"
+version = "0.2.0"
 description = "MongoDB-style document database backed by SQLite"
 readme = "README.md"
 license = { text = "MIT" }

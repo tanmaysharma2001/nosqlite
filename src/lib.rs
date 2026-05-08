@@ -33,7 +33,10 @@ pub use database::{Collection, Database};
 pub use error::{Error, Result};
 pub use index::{IndexInfo, IndexSpec};
 pub use io::Format;
-pub use ops::FindOptions;
+pub use ops::{
+    BulkWriteOptions, BulkWriteResult, FindOneAndDeleteOptions, FindOneAndUpdateOptions,
+    FindOptions, ReturnDocument, UpdateOptions, UpdateResult, WriteOp,
+};
 pub use transaction::{Transaction, TxCollection};
 pub use typed::{Document, TypedCollection, TypedFindCursor};
 pub use validation::{ValidationLevel, Validator};

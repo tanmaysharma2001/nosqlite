@@ -206,6 +206,135 @@ impl Collection {
             .map(|n| n as u32)
     }
 
+    /// Update a single document, with options. With `{ upsert: true }`,
+    /// inserts a new document if none match. Returns
+    /// `{ matchedCount, modifiedCount, upsertedId }`.
+    #[napi]
+    pub fn update_one_with_options(
+        &self,
+        filter: Value,
+        update: Value,
+        options: Option<UpdateOpts>,
+    ) -> Result<UpdateResult> {
+        let upsert = options.and_then(|o| o.upsert).unwrap_or(false);
+        let r = self
+            .db
+            .collection(&self.name)
+            .update_one_with_options(filter, update, nosqlite::UpdateOptions { upsert })
+            .map_err(map_err)?;
+        Ok(update_result_from(r))
+    }
+
+    #[napi]
+    pub fn update_many_with_options(
+        &self,
+        filter: Value,
+        update: Value,
+        options: Option<UpdateOpts>,
+    ) -> Result<UpdateResult> {
+        let upsert = options.and_then(|o| o.upsert).unwrap_or(false);
+        let r = self
+            .db
+            .collection(&self.name)
+            .update_many_with_options(filter, update, nosqlite::UpdateOptions { upsert })
+            .map_err(map_err)?;
+        Ok(update_result_from(r))
+    }
+
+    #[napi]
+    pub fn replace_one_with_options(
+        &self,
+        filter: Value,
+        replacement: Value,
+        options: Option<UpdateOpts>,
+    ) -> Result<UpdateResult> {
+        let upsert = options.and_then(|o| o.upsert).unwrap_or(false);
+        let r = self
+            .db
+            .collection(&self.name)
+            .replace_one_with_options(filter, replacement, nosqlite::UpdateOptions { upsert })
+            .map_err(map_err)?;
+        Ok(update_result_from(r))
+    }
+
+    /// Atomically find a document matching `filter` and apply `update`.
+    /// `options.returnDocument` is `"before"` (default) or `"after"`.
+    #[napi]
+    pub fn find_one_and_update(
+        &self,
+        filter: Value,
+        update: Value,
+        options: Option<FindOneAndUpdateOpts>,
+    ) -> Result<Option<Value>> {
+        let opts = parse_find_one_update_opts(options)?;
+        self.db
+            .collection(&self.name)
+            .find_one_and_update_with_options(filter, update, opts)
+            .map_err(map_err)
+    }
+
+    #[napi]
+    pub fn find_one_and_replace(
+        &self,
+        filter: Value,
+        replacement: Value,
+        options: Option<FindOneAndUpdateOpts>,
+    ) -> Result<Option<Value>> {
+        let opts = parse_find_one_update_opts(options)?;
+        self.db
+            .collection(&self.name)
+            .find_one_and_replace_with_options(filter, replacement, opts)
+            .map_err(map_err)
+    }
+
+    #[napi]
+    pub fn find_one_and_delete(
+        &self,
+        filter: Value,
+        options: Option<FindOneAndDeleteOpts>,
+    ) -> Result<Option<Value>> {
+        let opts = nosqlite::FindOneAndDeleteOptions {
+            sort: options.as_ref().and_then(|o| o.sort.clone()),
+            projection: options.as_ref().and_then(|o| o.projection.clone()),
+        };
+        self.db
+            .collection(&self.name)
+            .find_one_and_delete_with_options(filter, opts)
+            .map_err(map_err)
+    }
+
+    /// Return the unique values of `field` across documents matching
+    /// `filter`. Array fields contribute each element separately.
+    #[napi]
+    pub fn distinct(&self, field: String, filter: Option<Value>) -> Result<Vec<Value>> {
+        self.db
+            .collection(&self.name)
+            .distinct(&field, or_empty(filter))
+            .map_err(map_err)
+    }
+
+    /// Execute a sequence of writes in one transaction. `ops` is an array
+    /// of objects shaped like `{ insertOne: { document } }`,
+    /// `{ updateOne: { filter, update, upsert } }`, etc.
+    #[napi]
+    pub fn bulk_write(
+        &self,
+        ops: Vec<Value>,
+        options: Option<BulkWriteOpts>,
+    ) -> Result<BulkResult> {
+        let ordered = options.and_then(|o| o.ordered).unwrap_or(true);
+        let mut write_ops = Vec::with_capacity(ops.len());
+        for op in ops {
+            write_ops.push(parse_write_op(op)?);
+        }
+        let r = self
+            .db
+            .collection(&self.name)
+            .bulk_write_with_options(write_ops, nosqlite::BulkWriteOptions { ordered })
+            .map_err(map_err)?;
+        Ok(bulk_result_from(r))
+    }
+
     #[napi]
     pub fn aggregate(&self, pipeline: Vec<Value>) -> Result<Vec<Value>> {
         self.db
@@ -341,6 +470,163 @@ pub struct FindOptions {
 pub struct IndexOptions {
     pub unique: Option<bool>,
     pub name: Option<String>,
+}
+
+#[napi(object)]
+pub struct UpdateOpts {
+    pub upsert: Option<bool>,
+}
+
+#[napi(object)]
+pub struct UpdateResult {
+    pub matched_count: u32,
+    pub modified_count: u32,
+    pub upserted_id: Option<String>,
+}
+
+#[napi(object)]
+pub struct FindOneAndUpdateOpts {
+    pub upsert: Option<bool>,
+    pub return_document: Option<String>,
+    pub sort: Option<Value>,
+    pub projection: Option<Value>,
+}
+
+#[napi(object)]
+pub struct FindOneAndDeleteOpts {
+    pub sort: Option<Value>,
+    pub projection: Option<Value>,
+}
+
+#[napi(object)]
+pub struct BulkWriteOpts {
+    pub ordered: Option<bool>,
+}
+
+#[napi(object)]
+pub struct UpsertedIndex {
+    pub index: u32,
+    pub id: String,
+}
+
+#[napi(object)]
+pub struct BulkResult {
+    pub inserted_count: u32,
+    pub matched_count: u32,
+    pub modified_count: u32,
+    pub deleted_count: u32,
+    pub upserted_ids: Vec<UpsertedIndex>,
+}
+
+fn update_result_from(r: nosqlite::UpdateResult) -> UpdateResult {
+    UpdateResult {
+        matched_count: r.matched_count as u32,
+        modified_count: r.modified_count as u32,
+        upserted_id: r.upserted_id,
+    }
+}
+
+fn bulk_result_from(r: nosqlite::BulkWriteResult) -> BulkResult {
+    BulkResult {
+        inserted_count: r.inserted_count as u32,
+        matched_count: r.matched_count as u32,
+        modified_count: r.modified_count as u32,
+        deleted_count: r.deleted_count as u32,
+        upserted_ids: r
+            .upserted_ids
+            .into_iter()
+            .map(|(i, id)| UpsertedIndex {
+                index: i as u32,
+                id,
+            })
+            .collect(),
+    }
+}
+
+fn parse_find_one_update_opts(
+    options: Option<FindOneAndUpdateOpts>,
+) -> Result<nosqlite::FindOneAndUpdateOptions> {
+    let o = options.unwrap_or(FindOneAndUpdateOpts {
+        upsert: None,
+        return_document: None,
+        sort: None,
+        projection: None,
+    });
+    let return_document = match o.return_document.as_deref() {
+        Some("before") | None => nosqlite::ReturnDocument::Before,
+        Some("after") => nosqlite::ReturnDocument::After,
+        Some(other) => {
+            return Err(Error::from_reason(format!(
+                "returnDocument must be 'before' or 'after', got {:?}",
+                other
+            )))
+        }
+    };
+    Ok(nosqlite::FindOneAndUpdateOptions {
+        upsert: o.upsert.unwrap_or(false),
+        return_document,
+        sort: o.sort,
+        projection: o.projection,
+    })
+}
+
+fn parse_write_op(v: Value) -> Result<nosqlite::WriteOp> {
+    let obj = v
+        .as_object()
+        .ok_or_else(|| Error::from_reason("bulkWrite op must be an object"))?;
+    if obj.len() != 1 {
+        return Err(Error::from_reason(
+            "bulkWrite op must have exactly one key (e.g. 'insertOne')",
+        ));
+    }
+    let (kind, body) = obj.iter().next().unwrap();
+    let body_obj = body
+        .as_object()
+        .ok_or_else(|| Error::from_reason("bulkWrite op body must be an object"))?;
+    let take = |k: &str| -> Result<Value> {
+        body_obj
+            .get(k)
+            .cloned()
+            .ok_or_else(|| Error::from_reason(format!("{}.{} required", kind, k)))
+    };
+    let upsert_flag = || -> bool {
+        body_obj
+            .get("upsert")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    };
+    Ok(match kind.as_str() {
+        "insertOne" => nosqlite::WriteOp::InsertOne {
+            document: take("document")?,
+        },
+        "updateOne" => nosqlite::WriteOp::UpdateOne {
+            filter: take("filter")?,
+            update: take("update")?,
+            upsert: upsert_flag(),
+        },
+        "updateMany" => nosqlite::WriteOp::UpdateMany {
+            filter: take("filter")?,
+            update: take("update")?,
+            upsert: upsert_flag(),
+        },
+        "replaceOne" => nosqlite::WriteOp::ReplaceOne {
+            filter: take("filter")?,
+            replacement: take("replacement")?,
+            upsert: upsert_flag(),
+        },
+        "deleteOne" => nosqlite::WriteOp::DeleteOne {
+            filter: take("filter")?,
+        },
+        "deleteMany" => nosqlite::WriteOp::DeleteMany {
+            filter: take("filter")?,
+        },
+        other => {
+            return Err(Error::from_reason(format!(
+                "unknown bulkWrite op '{}'",
+                other
+            )))
+        }
+    })
 }
 
 #[napi]

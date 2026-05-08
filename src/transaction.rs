@@ -133,4 +133,101 @@ impl<'tx, 'db> TxCollection<'tx, 'db> {
         let conn = self.tx.conn.borrow();
         ops::delete_internal(*conn, &self.name, &filter, false)
     }
+
+    pub fn update_one_with_options(
+        &self,
+        filter: Value,
+        update: Value,
+        options: ops::UpdateOptions,
+    ) -> Result<ops::UpdateResult> {
+        let validator = self.tx.db.validator_for(&self.name)?;
+        let mut conn = self.tx.conn.borrow_mut();
+        ops::update_with_options(
+            *conn,
+            &self.name,
+            &filter,
+            &update,
+            true,
+            &options,
+            validator.as_ref(),
+        )
+    }
+
+    pub fn update_many_with_options(
+        &self,
+        filter: Value,
+        update: Value,
+        options: ops::UpdateOptions,
+    ) -> Result<ops::UpdateResult> {
+        let validator = self.tx.db.validator_for(&self.name)?;
+        let mut conn = self.tx.conn.borrow_mut();
+        ops::update_with_options(
+            *conn,
+            &self.name,
+            &filter,
+            &update,
+            false,
+            &options,
+            validator.as_ref(),
+        )
+    }
+
+    pub fn find_one_and_update(&self, filter: Value, update: Value) -> Result<Option<Value>> {
+        self.find_one_and_update_with_options(
+            filter,
+            update,
+            ops::FindOneAndUpdateOptions::default(),
+        )
+    }
+
+    pub fn find_one_and_update_with_options(
+        &self,
+        filter: Value,
+        update: Value,
+        options: ops::FindOneAndUpdateOptions,
+    ) -> Result<Option<Value>> {
+        let validator = self.tx.db.validator_for(&self.name)?;
+        let mut conn = self.tx.conn.borrow_mut();
+        ops::find_one_and_update(
+            *conn,
+            &self.name,
+            &filter,
+            &update,
+            &options,
+            validator.as_ref(),
+        )
+    }
+
+    pub fn find_one_and_replace(&self, filter: Value, replacement: Value) -> Result<Option<Value>> {
+        self.find_one_and_update(filter, replacement)
+    }
+
+    pub fn find_one_and_delete(&self, filter: Value) -> Result<Option<Value>> {
+        let mut conn = self.tx.conn.borrow_mut();
+        ops::find_one_and_delete(
+            *conn,
+            &self.name,
+            &filter,
+            &ops::FindOneAndDeleteOptions::default(),
+        )
+    }
+
+    pub fn distinct(&self, field: &str, filter: Value) -> Result<Vec<Value>> {
+        let conn = self.tx.conn.borrow();
+        ops::distinct(*conn, &self.name, field, &filter)
+    }
+
+    pub fn bulk_write(&self, write_ops: Vec<ops::WriteOp>) -> Result<ops::BulkWriteResult> {
+        self.bulk_write_with_options(write_ops, ops::BulkWriteOptions::default())
+    }
+
+    pub fn bulk_write_with_options(
+        &self,
+        write_ops: Vec<ops::WriteOp>,
+        options: ops::BulkWriteOptions,
+    ) -> Result<ops::BulkWriteResult> {
+        let validator = self.tx.db.validator_for(&self.name)?;
+        let mut conn = self.tx.conn.borrow_mut();
+        ops::bulk_write(*conn, &self.name, write_ops, &options, validator.as_ref())
+    }
 }

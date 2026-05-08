@@ -314,6 +314,145 @@ impl<'a> Collection<'a> {
         self.update_one(filter, replacement)
     }
 
+    /// Update a single document with options (e.g. `{ upsert: true }`).
+    /// Returns matched/modified counts and the upserted `_id` if a new
+    /// document was inserted.
+    pub fn update_one_with_options(
+        &self,
+        filter: Value,
+        update: Value,
+        options: ops::UpdateOptions,
+    ) -> Result<ops::UpdateResult> {
+        let validator = self.db.validator_for(&self.name)?;
+        let mut conn = self.db.lock()?;
+        ops::update_with_options(
+            &mut conn,
+            &self.name,
+            &filter,
+            &update,
+            true,
+            &options,
+            validator.as_ref(),
+        )
+    }
+
+    pub fn update_many_with_options(
+        &self,
+        filter: Value,
+        update: Value,
+        options: ops::UpdateOptions,
+    ) -> Result<ops::UpdateResult> {
+        let validator = self.db.validator_for(&self.name)?;
+        let mut conn = self.db.lock()?;
+        ops::update_with_options(
+            &mut conn,
+            &self.name,
+            &filter,
+            &update,
+            false,
+            &options,
+            validator.as_ref(),
+        )
+    }
+
+    pub fn replace_one_with_options(
+        &self,
+        filter: Value,
+        replacement: Value,
+        options: ops::UpdateOptions,
+    ) -> Result<ops::UpdateResult> {
+        self.update_one_with_options(filter, replacement, options)
+    }
+
+    /// Atomically find a document matching `filter` and apply `update` to it.
+    /// Returns the document — `Before` (default) returns the pre-update doc;
+    /// `After` returns the post-update doc. With `upsert: true` and no match,
+    /// inserts a synthesized doc; `Before` returns `None`, `After` returns
+    /// the inserted doc.
+    pub fn find_one_and_update(&self, filter: Value, update: Value) -> Result<Option<Value>> {
+        self.find_one_and_update_with_options(
+            filter,
+            update,
+            ops::FindOneAndUpdateOptions::default(),
+        )
+    }
+
+    pub fn find_one_and_update_with_options(
+        &self,
+        filter: Value,
+        update: Value,
+        options: ops::FindOneAndUpdateOptions,
+    ) -> Result<Option<Value>> {
+        let validator = self.db.validator_for(&self.name)?;
+        let mut conn = self.db.lock()?;
+        ops::find_one_and_update(
+            &mut conn,
+            &self.name,
+            &filter,
+            &update,
+            &options,
+            validator.as_ref(),
+        )
+    }
+
+    pub fn find_one_and_replace(&self, filter: Value, replacement: Value) -> Result<Option<Value>> {
+        self.find_one_and_update(filter, replacement)
+    }
+
+    pub fn find_one_and_replace_with_options(
+        &self,
+        filter: Value,
+        replacement: Value,
+        options: ops::FindOneAndUpdateOptions,
+    ) -> Result<Option<Value>> {
+        self.find_one_and_update_with_options(filter, replacement, options)
+    }
+
+    pub fn find_one_and_delete(&self, filter: Value) -> Result<Option<Value>> {
+        self.find_one_and_delete_with_options(filter, ops::FindOneAndDeleteOptions::default())
+    }
+
+    pub fn find_one_and_delete_with_options(
+        &self,
+        filter: Value,
+        options: ops::FindOneAndDeleteOptions,
+    ) -> Result<Option<Value>> {
+        let mut conn = self.db.lock()?;
+        ops::find_one_and_delete(&mut conn, &self.name, &filter, &options)
+    }
+
+    /// Return the unique values of `field` across documents matching
+    /// `filter`. Array values contribute each element separately, matching
+    /// MongoDB's `distinct()` semantics. Missing fields are skipped.
+    pub fn distinct(&self, field: &str, filter: Value) -> Result<Vec<Value>> {
+        let conn = self.db.lock()?;
+        ops::distinct(&conn, &self.name, field, &filter)
+    }
+
+    /// Execute a sequence of writes in a single SQLite transaction. With
+    /// `ordered: true` (default), the first failing op aborts and rolls
+    /// back; with `ordered: false`, individual op failures are tolerated
+    /// while subsequent ops continue.
+    pub fn bulk_write(&self, ops: Vec<ops::WriteOp>) -> Result<ops::BulkWriteResult> {
+        self.bulk_write_with_options(ops, ops::BulkWriteOptions::default())
+    }
+
+    pub fn bulk_write_with_options(
+        &self,
+        write_ops: Vec<ops::WriteOp>,
+        options: ops::BulkWriteOptions,
+    ) -> Result<ops::BulkWriteResult> {
+        let validator = self.db.validator_for(&self.name)?;
+        let mut conn = self.db.lock()?;
+        ops::bulk_write(
+            &mut conn,
+            &self.name,
+            write_ops,
+            &options,
+            validator.as_ref(),
+        )
+    }
+
     pub fn create_index(&self, keys: Value) -> Result<String> {
         self.create_index_with_options(keys, None)
     }

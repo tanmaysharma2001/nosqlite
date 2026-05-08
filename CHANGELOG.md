@@ -5,6 +5,47 @@ All notable changes are recorded here. The project follows
 
 ## [Unreleased]
 
+## 0.2.0 — CRUD parity
+
+Closes the most common "wait, this is missing?" gaps for callers migrating
+from MongoDB. Tier 1 of the post-0.1 roadmap.
+
+### Added
+- **Upsert.** `update_one_with_options`, `update_many_with_options`, and
+  `replace_one_with_options` accept `UpdateOptions { upsert: bool }` and
+  return an `UpdateResult { matched_count, modified_count, upserted_id }`.
+  When no document matches and `upsert: true`, a new document is built
+  from the filter's top-level equality clauses (operator clauses are
+  skipped) plus the update operators, then inserted.
+- **`find_one_and_update` / `find_one_and_replace` / `find_one_and_delete`.**
+  Atomic find-and-mutate that returns the document. Accepts
+  `FindOneAndUpdateOptions { upsert, return_document, sort, projection }`
+  and `FindOneAndDeleteOptions { sort, projection }`.
+  `ReturnDocument::Before` (default) returns the pre-mutation doc;
+  `ReturnDocument::After` returns the post-mutation doc.
+- **`distinct(field, filter)`.** Returns the unique values of `field`
+  across documents matching `filter`. Array-valued fields contribute each
+  element separately, matching MongoDB's semantics.
+- **`bulk_write(ops)`.** Executes a sequence of `WriteOp::{InsertOne,
+  UpdateOne, UpdateMany, ReplaceOne, DeleteOne, DeleteMany}` in a single
+  SQLite transaction. Returns a `BulkWriteResult` with per-op counters and
+  the list of upserted ids. `BulkWriteOptions { ordered }` toggles ordered
+  (default — abort on first error) vs. unordered (continue past op
+  failures, e.g. unique-key conflicts).
+- **`$expr` filter operator.** Filters can now reference computed
+  expressions, e.g. `{ "$expr": { "$gt": ["$a", "$b"] } }`. Top-level
+  `$expr` is post-filtered in Rust against rows returned by the SQL pass,
+  so it composes with other clauses (`{kind: "A", $expr: ...}`).
+- **More aggregation expression operators.** Added comparison (`$eq`,
+  `$ne`, `$gt`, `$gte`, `$lt`, `$lte`), boolean (`$and`, `$or`, `$not`),
+  and conditional (`$cond`) — usable both inside `$expr` filters and
+  inside `$addFields` / `$group` accumulators.
+
+All of the above are mirrored on `TxCollection` so they participate in
+explicit `db.transaction(|tx| { ... })` blocks.
+
+## 0.1.1
+
 ### Added
 - **Typed Rust API.** `db.typed_collection::<User>("users")` returns a
   `TypedCollection<User>` whose `insert_one`/`find_one`/`find().into_vec()` /

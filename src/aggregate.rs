@@ -455,7 +455,10 @@ fn update_accumulator(acc: &mut Accumulator, expr: &Value, doc: &Value) -> Resul
 ///   * `{ "$concat": [a, b, ...] }` for strings
 ///   * `{ "$toUpper": e }` / `$toLower`
 ///   * `{ "$ifNull": [a, b] }`
-fn eval_expr(doc: &Value, expr: &Value) -> Result<Value> {
+///   * Comparison: `$eq` `$ne` `$gt` `$gte` `$lt` `$lte`
+///   * Boolean: `$and` `$or` `$not`
+///   * Conditional: `$cond`
+pub(crate) fn eval_expr(doc: &Value, expr: &Value) -> Result<Value> {
     match expr {
         Value::String(s) if s.starts_with('$') => {
             let path = &s[1..];
@@ -537,10 +540,79 @@ fn eval_op(doc: &Value, op: &str, arg: &Value) -> Result<Value> {
             })
         }
         "$literal" => Ok(arg.clone()),
+        "$eq" | "$ne" | "$gt" | "$gte" | "$lt" | "$lte" => {
+            let args = eval_args(doc, arg)?;
+            if args.len() != 2 {
+                return Err(Error::InvalidQuery(format!("{} takes two args", op)));
+            }
+            let ord = matcher::compare(Some(&args[0]), &args[1]);
+            let r = match op {
+                "$eq" => args[0] == args[1],
+                "$ne" => args[0] != args[1],
+                "$gt" => matches!(ord, Some(Ordering::Greater)),
+                "$gte" => matches!(ord, Some(Ordering::Greater) | Some(Ordering::Equal)),
+                "$lt" => matches!(ord, Some(Ordering::Less)),
+                "$lte" => matches!(ord, Some(Ordering::Less) | Some(Ordering::Equal)),
+                _ => unreachable!(),
+            };
+            Ok(Value::Bool(r))
+        }
+        "$and" => {
+            let args = eval_args(doc, arg)?;
+            Ok(Value::Bool(args.iter().all(is_truthy)))
+        }
+        "$or" => {
+            let args = eval_args(doc, arg)?;
+            Ok(Value::Bool(args.iter().any(is_truthy)))
+        }
+        "$not" => {
+            let v = eval_expr(doc, arg)?;
+            Ok(Value::Bool(!is_truthy(&v)))
+        }
+        "$cond" => {
+            let (cond, t, f) = match arg {
+                Value::Array(a) if a.len() == 3 => (a[0].clone(), a[1].clone(), a[2].clone()),
+                Value::Object(o) => {
+                    let cond = o
+                        .get("if")
+                        .cloned()
+                        .ok_or_else(|| Error::InvalidQuery("$cond requires 'if'".into()))?;
+                    let t = o
+                        .get("then")
+                        .cloned()
+                        .ok_or_else(|| Error::InvalidQuery("$cond requires 'then'".into()))?;
+                    let f = o
+                        .get("else")
+                        .cloned()
+                        .ok_or_else(|| Error::InvalidQuery("$cond requires 'else'".into()))?;
+                    (cond, t, f)
+                }
+                _ => {
+                    return Err(Error::InvalidQuery(
+                        "$cond takes [if,then,else] or {if,then,else}".into(),
+                    ))
+                }
+            };
+            let cv = eval_expr(doc, &cond)?;
+            if is_truthy(&cv) {
+                eval_expr(doc, &t)
+            } else {
+                eval_expr(doc, &f)
+            }
+        }
         other => Err(Error::InvalidQuery(format!(
             "unknown expression op {}",
             other
         ))),
+    }
+}
+
+pub(crate) fn is_truthy(v: &Value) -> bool {
+    match v {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        Value::Number(n) => n.as_f64().map(|f| f != 0.0).unwrap_or(false),
+        _ => true,
     }
 }
 

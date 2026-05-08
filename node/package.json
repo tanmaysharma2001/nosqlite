@@ -1,6 +1,6 @@
 {
   "name": "nosqlite",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "MongoDB-style document database backed by SQLite",
   "main": "index.js",
   "types": "index.d.ts",
@@ -21,7 +21,7 @@
   "scripts": {
     "build": "napi build --release --strip",
     "build:debug": "napi build",
-    "test": "node test/smoke.js && node test/odm.js"
+    "test": "node test/smoke.js && node test/odm.js && node test/v0_2_0.js"
   },
   "devDependencies": {
     "@napi-rs/cli": "^2.18.0"
