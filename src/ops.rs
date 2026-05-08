@@ -895,12 +895,10 @@ pub fn distinct(conn: &Connection, name: &str, field: &str, filter: &Value) -> R
                     }
                 }
             }
-            Some(other) => {
-                if !seen.iter().any(|x| x == &other) {
-                    seen.push(other);
-                }
+            Some(other) if !seen.iter().any(|x| x == &other) => {
+                seen.push(other);
             }
-            None => {}
+            _ => {}
         }
     }
     Ok(seen)
