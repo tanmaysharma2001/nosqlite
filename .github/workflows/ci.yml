@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  rust:
+    name: Rust ${{ matrix.toolchain }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        toolchain: [stable]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+      - name: cargo clippy
+        run: cargo clippy --all-targets --all-features
+      - name: cargo test (default features)
+        run: cargo test --all-targets
+      - name: cargo test (--features bson)
+        run: cargo test --all-targets --features bson
+      - name: cargo doc
+        run: cargo doc --no-deps --all-features
+      - name: example builds
+        run: |
+          cargo build --release --example basic
+          cargo build --release --example bench
+      - name: bench smoke (100k docs)
+        run: cargo run --release --example bench
+
+  python:
+    name: Python SDK
+    runs-on: ${{ matrix.os }}
+    needs: rust
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: python
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: install maturin
+        run: pip install --upgrade pip maturin
+      - name: build wheel
+        working-directory: python
+        run: maturin develop --release
+      - name: smoke test
+        working-directory: python
+        run: python tests/test_smoke.py
+
+  node:
+    name: Node SDK
+    runs-on: ${{ matrix.os }}
+    needs: rust
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node-version: [18, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: node
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - name: npm install
+        working-directory: node
+        run: npm install
+      - name: build native module
+        working-directory: node
+        run: npx napi build --release --strip
+      - name: smoke test
+        working-directory: node
+        run: npm test

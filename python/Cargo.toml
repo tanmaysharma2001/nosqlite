@@ -1,0 +1,16 @@
+[package]
+name = "nosqlite-py"
+version = "0.1.0"
+edition = "2021"
+description = "Python bindings for the NoSQLite document database"
+license = "MIT"
+
+[lib]
+name = "_nosqlite"
+crate-type = ["cdylib"]
+
+[dependencies]
+nosqlite = { path = "..", features = ["bson"] }
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py38"] }
+pythonize = "0.22"
+serde_json = { version = "1", features = ["preserve_order"] }

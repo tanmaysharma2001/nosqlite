@@ -1,0 +1,22 @@
+[package]
+name = "nosqlite-node"
+version = "0.1.0"
+edition = "2021"
+description = "Node.js bindings for the NoSQLite document database"
+license = "MIT"
+
+[lib]
+name = "nosqlite_node"
+crate-type = ["cdylib"]
+
+[dependencies]
+napi = { version = "2", default-features = false, features = ["napi9", "serde-json"] }
+napi-derive = "2"
+nosqlite = { path = "..", features = ["bson"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[build-dependencies]
+napi-build = "2"
+
+[profile.release]
+lto = true

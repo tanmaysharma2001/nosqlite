@@ -1,0 +1,29 @@
+{
+  "name": "nosqlite",
+  "version": "0.1.0",
+  "description": "MongoDB-style document database backed by SQLite",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "license": "MIT",
+  "engines": {
+    "node": ">=14"
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "odm.js",
+    "*.node"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./odm": "./odm.js"
+  },
+  "scripts": {
+    "build": "napi build --release --strip",
+    "build:debug": "napi build",
+    "test": "node test/smoke.js && node test/odm.js"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^2.18.0"
+  }
+}
