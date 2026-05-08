@@ -5,6 +5,15 @@ All notable changes are recorded here. The project follows
 
 ## [Unreleased]
 
+### Changed
+- **`$expr` now works at any depth.** Previously only top-level `$expr`
+  was honoured; nested forms like `{$or: [{x: 1}, {$expr: ...}]}` errored
+  during SQL compilation. The compiler now strips `$expr` recursively
+  (replacing it with always-true placeholders so SQL still runs as a
+  candidate filter) and post-filters each row through the in-memory
+  matcher with the original filter. Indexes still apply to the
+  non-`$expr` portion of the filter.
+
 ## 0.2.0 — CRUD parity
 
 Closes the most common "wait, this is missing?" gaps for callers migrating
@@ -66,7 +75,7 @@ explicit `db.transaction(|tx| { ... })` blocks.
 ## 0.1.0 — initial release
 
 The initial public release covers all five phases of the original roadmap
-except for ORM adapters and a hosted docs site.
+except for a hosted docs site.
 
 ### Phase 1 — Foundation
 - One SQLite table per collection, ULID-based `_id` generation, atomic
@@ -106,14 +115,15 @@ except for ORM adapters and a hosted docs site.
 - `nosqlite <file>` interactive CLI shell (REPL with `.find`, `.aggregate`,
   `.text-index`, `.import`, `.explain`, `.indexes`, `.collections`, …).
 - Python SDK via PyO3 + maturin at [python/](python/), exposing the full
-  Rust API including transactions as a context manager.
+  Rust API including transactions as a context manager. Pydantic-based
+  ODM (`nosqlite.orm.Document`) for typed model round-tripping.
 - Node.js SDK via napi-rs at [node/](node/), with auto-generated
-  TypeScript declarations.
+  TypeScript declarations. Mongoose-style ODM (`nosqlite/odm`) with
+  schemas, validators, and lifecycle hooks.
 - [MIGRATING.md](MIGRATING.md) — MongoDB → NoSQLite cheatsheet.
 
 The `.nosqlite` file format is identical across the Rust crate, the CLI
 shell, the Python module, and the Node module.
 
 ### Not yet
-- Mongoose / SQLAlchemy ORM adapters.
 - Hosted docs site.

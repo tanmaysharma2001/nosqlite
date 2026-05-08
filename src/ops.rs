@@ -205,9 +205,9 @@ pub fn count(conn: &Connection, name: &str, filter: &Value) -> Result<i64> {
     if !table_exists(conn, name)? {
         return Ok(0);
     }
-    let exprs = extract_exprs(filter);
+    let post = post_filter_of(filter);
     let (where_clause, params) = build_where(name, filter)?;
-    if exprs.is_empty() {
+    if post.is_none() {
         let sql = format!("SELECT COUNT(*) FROM \"{}\" WHERE {}", name, where_clause);
         let mut stmt = conn.prepare(&sql)?;
         let n: i64 = stmt.query_row(rusqlite::params_from_iter(params.iter()), |r| r.get(0))?;
@@ -224,10 +224,11 @@ pub fn count(conn: &Connection, name: &str, filter: &Value) -> Result<i64> {
             .collect();
         collected?
     };
+    let post = post.unwrap();
     let mut n = 0i64;
     for s in rows {
         let v: Value = serde_json::from_str(&s)?;
-        if expr_matches(&v, &exprs)? {
+        if crate::matcher::matches(&v, &post)? {
             n += 1;
         }
     }
@@ -243,9 +244,9 @@ pub fn find_into_vec(
     if !table_exists(conn, name)? {
         return Ok(Vec::new());
     }
-    let exprs = extract_exprs(filter);
+    let post = post_filter_of(filter);
     // If $expr is present, defer LIMIT/SKIP to after the in-Rust filter.
-    let (sql_opts, post_skip, post_limit) = if exprs.is_empty() {
+    let (sql_opts, post_skip, post_limit) = if post.is_none() {
         (opts.clone(), None, None)
     } else {
         (
@@ -273,8 +274,10 @@ pub fn find_into_vec(
     let mut skipped = 0i64;
     for s in raw {
         let v: Value = serde_json::from_str(&s)?;
-        if !exprs.is_empty() && !expr_matches(&v, &exprs)? {
-            continue;
+        if let Some(p) = &post {
+            if !crate::matcher::matches(&v, p)? {
+                continue;
+            }
         }
         if let Some(n) = post_skip {
             if skipped < n {
@@ -349,7 +352,7 @@ fn build_find_sql(
 /// Compile `filter` into a SQL `WHERE`-fragment and parameter list,
 /// handling any top-level `$text` operators by merging in an FTS subquery.
 fn build_where(name: &str, filter: &Value) -> Result<(String, Vec<SqlValue>)> {
-    let (rest, text_clauses, _exprs) = split_special(filter);
+    let (rest, text_clauses, _post) = split_special(filter);
     let compiled = query::compile(&rest)?;
     let mut where_clause = compiled.sql;
     let mut params = compiled.params;
@@ -364,51 +367,81 @@ fn build_where(name: &str, filter: &Value) -> Result<(String, Vec<SqlValue>)> {
     Ok((where_clause, params))
 }
 
-/// Walk `filter` removing top-level `$text` and `$expr` operators and
-/// returning the rewritten filter plus the search strings (text) and
-/// expression bodies that need post-filtering in Rust.
-fn split_special(filter: &Value) -> (Value, Vec<String>, Vec<Value>) {
+/// Returns `Some(post)` when the filter has any `$expr`, where `post`
+/// must be checked against each fetched row via the in-memory matcher.
+fn post_filter_of(filter: &Value) -> Option<Value> {
+    split_special(filter).2
+}
+
+/// Walk `filter` building a SQL-compilable version: top-level `$text` is
+/// extracted into `texts` for an FTS subquery, and `$expr` is stripped
+/// recursively (replaced with always-true placeholders inside `$and` /
+/// `$or` / `$nor`). The third return value is the original filter with
+/// `$text` removed — passed to the in-memory matcher to enforce `$expr`
+/// (and any other clauses the SQL filter loosened) post-fetch.
+///
+/// A `$expr` removed from a single-key object (`{$expr: ...}`) becomes
+/// `{}`, which compiles to `1=1` and matches every row — false positives
+/// are then pruned by the matcher post-filter. This means $expr inside
+/// $and tightens nothing but $expr inside $or correctly widens the SQL
+/// scan to include candidates the matcher will keep.
+fn split_special(filter: &Value) -> (Value, Vec<String>, Option<Value>) {
     let mut texts = Vec::new();
-    let mut exprs = Vec::new();
-    let rest = match filter {
+    let mut has_expr = false;
+    let sql_filter = strip_for_sql(filter, &mut texts, true, &mut has_expr);
+    let post = if has_expr {
+        Some(strip_text_only(filter))
+    } else {
+        None
+    };
+    (sql_filter, texts, post)
+}
+
+fn strip_for_sql(
+    v: &Value,
+    texts: &mut Vec<String>,
+    top_level: bool,
+    has_expr: &mut bool,
+) -> Value {
+    match v {
         Value::Object(o) => {
             let mut new_obj = serde_json::Map::new();
-            for (k, v) in o {
-                match k.as_str() {
-                    "$text" => {
-                        if let Some(s) = v.get("$search").and_then(|x| x.as_str()) {
-                            texts.push(s.to_string());
-                            continue;
-                        }
-                    }
-                    "$expr" => {
-                        exprs.push(v.clone());
+            for (k, vv) in o {
+                if top_level && k == "$text" {
+                    if let Some(s) = vv.get("$search").and_then(|x| x.as_str()) {
+                        texts.push(s.to_string());
                         continue;
                     }
-                    _ => {}
                 }
-                new_obj.insert(k.clone(), v.clone());
+                if k == "$expr" {
+                    *has_expr = true;
+                    continue;
+                }
+                new_obj.insert(k.clone(), strip_for_sql(vv, texts, false, has_expr));
             }
             Value::Object(new_obj)
         }
-        _ => filter.clone(),
-    };
-    (rest, texts, exprs)
-}
-
-/// Returns true if the doc satisfies every `$expr` body in `exprs`.
-fn expr_matches(doc: &Value, exprs: &[Value]) -> Result<bool> {
-    for e in exprs {
-        let v = crate::aggregate::eval_expr(doc, e)?;
-        if !crate::aggregate::is_truthy(&v) {
-            return Ok(false);
-        }
+        Value::Array(arr) => Value::Array(
+            arr.iter()
+                .map(|x| strip_for_sql(x, texts, false, has_expr))
+                .collect(),
+        ),
+        _ => v.clone(),
     }
-    Ok(true)
 }
 
-fn extract_exprs(filter: &Value) -> Vec<Value> {
-    split_special(filter).2
+fn strip_text_only(filter: &Value) -> Value {
+    if let Value::Object(o) = filter {
+        let mut new_obj = serde_json::Map::new();
+        for (k, v) in o {
+            if k == "$text" {
+                continue;
+            }
+            new_obj.insert(k.clone(), v.clone());
+        }
+        return Value::Object(new_obj);
+    }
+    filter.clone()
 }
 
 fn compile_order_by(spec: &Value) -> Result<String> {
@@ -563,11 +596,11 @@ fn update_rows_in(
     only_one: bool,
     validator: Option<&Validator>,
 ) -> Result<u64> {
-    let exprs = extract_exprs(filter);
+    let post = post_filter_of(filter);
     let (where_clause, where_params) = build_where(name, filter)?;
     // When $expr is present we can't push LIMIT down to SQL, so load
     // candidates and filter in Rust.
-    let select_sql = if only_one && exprs.is_empty() {
+    let select_sql = if only_one && post.is_none() {
         format!(
             "SELECT _id, doc FROM \"{}\" WHERE {} LIMIT 1",
             name, where_clause
@@ -597,8 +630,10 @@ fn update_rows_in(
         let mut stmt = conn.prepare(&upd_sql)?;
         for (id, raw) in rows {
             let mut doc: Value = serde_json::from_str(&raw)?;
-            if !exprs.is_empty() && !expr_matches(&doc, &exprs)? {
-                continue;
+            if let Some(p) = &post {
+                if !crate::matcher::matches(&doc, p)? {
+                    continue;
+                }
             }
             update::apply(&mut doc, update_doc)?;
             if let Some(o) = doc.as_object_mut() {
@@ -627,10 +662,10 @@ pub fn delete_internal(
     if !table_exists(conn, name)? {
         return Ok(0);
     }
-    let exprs = extract_exprs(filter);
+    let post = post_filter_of(filter);
     let (where_clause, where_params) = build_where(name, filter)?;
 
-    if exprs.is_empty() {
+    if post.is_none() {
         let sql = if only_one {
             format!(
                 "DELETE FROM \"{0}\" WHERE _id IN \
@@ -644,6 +679,7 @@ pub fn delete_internal(
         crate::fts::clear_orphans(conn, name)?;
         return Ok(n as u64);
     }
+    let post = post.unwrap();
 
     // $expr: identify ids in Rust, then delete by id list.
     let select_sql = format!("SELECT _id, doc FROM \"{}\" WHERE {}", name, where_clause);
@@ -660,7 +696,7 @@ pub fn delete_internal(
     let mut to_delete: Vec<String> = Vec::new();
     for (id, raw) in candidates {
         let v: Value = serde_json::from_str(&raw)?;
-        if expr_matches(&v, &exprs)? {
+        if crate::matcher::matches(&v, &post)? {
             to_delete.push(id);
             if only_one {
                 break;
@@ -830,7 +866,7 @@ pub fn distinct(conn: &Connection, name: &str, field: &str, filter: &Value) -> R
     if !table_exists(conn, name)? {
         return Ok(Vec::new());
     }
-    let exprs = extract_exprs(filter);
+    let post = post_filter_of(filter);
     let (where_clause, where_params) = build_where(name, filter)?;
     let sql = format!("SELECT doc FROM \"{}\" WHERE {}", name, where_clause);
     let mut stmt = conn.prepare(&sql)?;
@@ -845,8 +881,10 @@ pub fn distinct(conn: &Connection, name: &str, field: &str, filter: &Value) -> R
     let mut seen: Vec<Value> = Vec::new();
     for s in raw {
         let v: Value = serde_json::from_str(&s)?;
-        if !exprs.is_empty() && !expr_matches(&v, &exprs)? {
-            continue;
+        if let Some(p) = &post {
+            if !crate::matcher::matches(&v, p)? {
+                continue;
+            }
         }
         let extracted = crate::matcher::lookup_path(&v, field).cloned();
         match extracted {

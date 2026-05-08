@@ -456,3 +456,109 @@ fn bulk_write_in_transaction() {
     assert_eq!(c.find_one(json!({ "_id": "a" })).unwrap().unwrap()["n"], 11);
     assert_eq!(c.find_one(json!({ "_id": "b" })).unwrap().unwrap()["n"], 2);
 }
+
+#[test]
+fn expr_nested_in_or() {
+    let db = db();
+    let c = db.collection("e");
+    c.insert_many(vec![
+        json!({ "_id": "x", "kind": "A", "a": 1, "b": 5 }),
+        json!({ "_id": "y", "kind": "B", "a": 5, "b": 1 }),
+        json!({ "_id": "z", "kind": "C", "a": 0, "b": 0 }),
+    ])
+    .unwrap();
+    // kind=="A" OR a > b. Matches x (kind A) and y (5 > 1).
+    let docs = c
+        .find(json!({
+            "$or": [
+                { "kind": "A" },
+                { "$expr": { "$gt": ["$a", "$b"] } }
+            ]
+        }))
+        .into_vec()
+        .unwrap();
+    let mut ids: Vec<String> = docs
+        .iter()
+        .map(|d| d["_id"].as_str().unwrap().to_string())
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec!["x", "y"]);
+}
+
+#[test]
+fn expr_nested_in_and() {
+    let db = db();
+    let c = db.collection("e");
+    c.insert_many(vec![
+        json!({ "_id": "x", "kind": "A", "a": 5, "b": 1 }),
+        json!({ "_id": "y", "kind": "A", "a": 2, "b": 4 }),
+        json!({ "_id": "z", "kind": "B", "a": 9, "b": 1 }),
+    ])
+    .unwrap();
+    // kind=="A" AND a > b. Only x matches.
+    let docs = c
+        .find(json!({
+            "$and": [
+                { "kind": "A" },
+                { "$expr": { "$gt": ["$a", "$b"] } }
+            ]
+        }))
+        .into_vec()
+        .unwrap();
+    assert_eq!(docs.len(), 1);
+    assert_eq!(docs[0]["_id"], "x");
+}
+
+#[test]
+fn expr_nested_deep() {
+    let db = db();
+    let c = db.collection("e");
+    c.insert_many(vec![
+        json!({ "_id": "x", "kind": "A", "a": 5, "b": 1, "n": 1 }),
+        json!({ "_id": "y", "kind": "A", "a": 1, "b": 5, "n": 2 }),
+        json!({ "_id": "z", "kind": "B", "a": 7, "b": 1, "n": 1 }),
+    ])
+    .unwrap();
+    // n==1 AND (kind=="A" OR a > b)
+    let docs = c
+        .find(json!({
+            "$and": [
+                { "n": 1 },
+                { "$or": [
+                    { "kind": "A" },
+                    { "$expr": { "$gt": ["$a", "$b"] } }
+                ]}
+            ]
+        }))
+        .into_vec()
+        .unwrap();
+    let mut ids: Vec<String> = docs
+        .iter()
+        .map(|d| d["_id"].as_str().unwrap().to_string())
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec!["x", "z"]);
+}
+
+#[test]
+fn expr_nested_in_or_with_count_and_delete() {
+    let db = db();
+    let c = db.collection("e");
+    c.insert_many(vec![
+        json!({ "_id": "x", "tag": "keep", "a": 1, "b": 9 }),
+        json!({ "_id": "y", "tag": "drop", "a": 5, "b": 1 }),
+        json!({ "_id": "z", "tag": "drop", "a": 1, "b": 5 }),
+    ])
+    .unwrap();
+    let filter = json!({
+        "$or": [
+            { "tag": "keep" },
+            { "$expr": { "$gt": ["$a", "$b"] } }
+        ]
+    });
+    assert_eq!(c.count(filter.clone()).unwrap(), 2);
+    let n = c.delete_many(filter).unwrap();
+    assert_eq!(n, 2);
+    assert_eq!(c.count_all().unwrap(), 1);
+    assert_eq!(c.find_one(json!({})).unwrap().unwrap()["_id"], "z");
+}
