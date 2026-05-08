@@ -62,14 +62,18 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: install maturin
-        run: pip install --upgrade pip maturin
-      - name: build wheel
+      - name: build wheel + run tests
         working-directory: python
-        run: maturin develop --release
-      - name: smoke test
-        working-directory: python
-        run: python tests/test_smoke.py
+        # `maturin develop` insists on an active virtualenv; create a
+        # throwaway one inside the package directory and activate it for
+        # the duration of this step.
+        run: |
+          python -m venv .venv
+          . .venv/bin/activate
+          pip install --upgrade pip maturin pydantic
+          maturin develop --release
+          python tests/test_smoke.py
+          python tests/test_orm.py
 
   node:
     name: Node SDK
